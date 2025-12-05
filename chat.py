@@ -1,5 +1,6 @@
 import os
 import time
+import json
 import sqlite3
 from openai import OpenAI
 
@@ -11,10 +12,18 @@ CHAT_ID = int(time.time())   # Identifies this run
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 SYSTEM_PROMPT = (
-    "Ich schreibe an einem Kurs über Geschichte. "
-    "Gib mir das folgende Kapitel als zusammenhängenden Prosatext "
-    "auf Englisch, ohne Gedankenstriche, keine '---', "
-    "und mit Zwischenüberschriften in der obersten Ebene mit '#'."
+    "You are helping to write a history course.\n"
+    "For each request you receive a chapter title in German.\n"
+    "You MUST answer ONLY with valid JSON of the form:\n"
+    "{\n"
+    '  "english_title": "<short English chapter title>",\n'
+    '  "chapter_text": "<full chapter text in English>"\n'
+    "}\n"
+    "- english_title: a concise English chapter heading.\n"
+    "- chapter_text: a continuous prose chapter in English, "
+    "with top-level headings using '#', no bullet lists, "
+    "no '---' separators.\n"
+    "Do not write any text outside the JSON."
 )
 
 # --------- DB setup ---------
@@ -22,11 +31,13 @@ def init_db():
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
 
+    # Chapters: keep both German and English titles
     cur.execute("""
     CREATE TABLE IF NOT EXISTS chapters (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         chat_id INTEGER NOT NULL,
-        title TEXT NOT NULL,
+        original_title TEXT NOT NULL,   -- German
+        title TEXT NOT NULL,            -- English
         level INTEGER NOT NULL,
         parent_id INTEGER,
         position INTEGER NOT NULL,
@@ -51,15 +62,15 @@ def init_db():
     conn.close()
 
 
-def create_chapter(chat_id, title, level, parent_id, position):
+def create_chapter(chat_id, original_title, english_title, level, parent_id, position):
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO chapters (chat_id, title, level, parent_id, position)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO chapters (chat_id, original_title, title, level, parent_id, position)
+        VALUES (?, ?, ?, ?, ?, ?)
         """,
-        (chat_id, title, level, parent_id, position),
+        (chat_id, original_title, english_title, level, parent_id, position),
     )
     chapter_id = cur.lastrowid
     conn.commit()
@@ -78,12 +89,18 @@ def save_message(chat_id, chapter_id, role, content):
 
 
 # --------- OpenAI interaction ---------
-def send_to_existing_chat(chapter_id, user_message: str) -> str:
-    save_message(CHAT_ID, chapter_id, "user", user_message)
-
+def generate_chapter_from_german_title(german_title: str) -> tuple[str, str]:
+    """
+    Sends the German chapter title and gets back:
+      - english_title
+      - chapter_text (English prose)
+    """
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user_message},
+        {
+            "role": "user",
+            "content": f"Kapitelüberschrift (Deutsch): \"{german_title}\"",
+        },
     ]
 
     response = client.chat.completions.create(
@@ -91,20 +108,34 @@ def send_to_existing_chat(chapter_id, user_message: str) -> str:
         messages=messages,
     )
 
-    assistant_message = response.choices[0].message.content
+    raw_content = response.choices[0].message.content
 
-    save_message(CHAT_ID, chapter_id, "assistant", assistant_message)
+    # Parse the JSON returned by the model
+    try:
+        data = json.loads(raw_content)
+    except json.JSONDecodeError as e:
+        # In case the model slips and adds extra text, you could add
+        # some cleanup or debugging here.
+        raise RuntimeError(f"Model did not return valid JSON: {raw_content}") from e
 
-    return assistant_message
+    english_title = data.get("english_title", "").strip()
+    chapter_text = data.get("chapter_text", "").strip()
+
+    if not english_title:
+        raise RuntimeError(f"No 'english_title' in model response: {raw_content}")
+    if not chapter_text:
+        raise RuntimeError(f"No 'chapter_text' in model response: {raw_content}")
+
+    return english_title, chapter_text
 
 
 # --------- Parse chapters.txt by '#' hierarchy ---------
 def parse_chapters_file(filename: str):
     """
-    Lines must look like:
-    # Title
-    ## Subtitle
-    ### Sub-subtitle
+    Lines should look like:
+    # Kapitel 1
+    ## Unterkapitel 1.1
+    ### Unter-Unterkapitel 1.1.1
     """
     with open(filename, encoding="utf-8") as f:
         for raw_line in f:
@@ -112,7 +143,6 @@ def parse_chapters_file(filename: str):
             if not line:
                 continue
 
-            # Count # at start
             if not line.startswith("#"):
                 raise ValueError(f"Invalid line (must start with #): {line}")
 
@@ -120,9 +150,9 @@ def parse_chapters_file(filename: str):
             while level < len(line) and line[level] == "#":
                 level += 1
 
-            title = line[level:].strip()
+            title = line[level:].strip()   # German title
 
-            yield level - 1, title   # level 0 = one '#'
+            yield level - 1, title   # level 0 for one '#'
 
 
 # --------- Main ---------
@@ -132,8 +162,7 @@ if __name__ == "__main__":
     level_stack = []  # at index L → chapter_id at level L
     position_counter = 0
 
-    for level, title in parse_chapters_file("chapters.txt"):
-
+    for level, german_title in parse_chapters_file("chapters.txt"):
         # Shrink stack when moving up in hierarchy
         while len(level_stack) > level + 1:
             level_stack.pop()
@@ -143,27 +172,36 @@ if __name__ == "__main__":
         if level > 0:
             parent_id = level_stack[level - 1]
 
-        # Create new chapter record
+        print(f"\n=== Processing L{level}: {german_title} (parent={parent_id}) ===")
+
+        # 1) Ask the model to give an English title + chapter text
+        english_title, chapter_text = generate_chapter_from_german_title(german_title)
+
+        print(f"  → English title: {english_title}")
+
+        # 2) Create chapter record in DB with English title
         chapter_id = create_chapter(
             CHAT_ID,
-            title,
-            level,
-            parent_id,
-            position_counter
+            original_title=german_title,
+            english_title=english_title,
+            level=level,
+            parent_id=parent_id,
+            position=position_counter,
         )
         position_counter += 1
 
-        # Update stack
+        # 3) Update stack for hierarchy
         if len(level_stack) == level:
             level_stack.append(chapter_id)
         else:
             level_stack[level] = chapter_id
 
-        print(f"Processing L{level}: {title} (id={chapter_id}, parent={parent_id})")
+        # 4) Save messages (German input + English chapter text)
+        save_message(CHAT_ID, chapter_id, "user", german_title)
+        save_message(CHAT_ID, chapter_id, "assistant", chapter_text)
 
-        # Send chapter title to ChatGPT
-        reply = send_to_existing_chat(chapter_id, title)
-
-        print("\nAssistant:\n", reply)
+        # 5) Print result
+        print("\n--- Chapter text (assistant) ---\n")
+        print(chapter_text)
         print("\n" + "=" * 80 + "\n")
 
