@@ -4,14 +4,15 @@ import json
 import sqlite3
 from typing import Dict, Any, Tuple, Optional
 
+import requests
 from openai import OpenAI
-import mysql.connector
 
-# --------- OpenAI / general config ---------
+# ------------ Config ------------
 MODEL = "gpt-5.1"
 SQLITE_DB_FILE = "chat_history.db"
-CHAT_ID = int(time.time())   # Identifies this run
+CHAT_ID = int(time.time())
 
+# OpenAI
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 SYSTEM_PROMPT = (
@@ -29,33 +30,17 @@ SYSTEM_PROMPT = (
     "Do not write any text outside the JSON."
 )
 
-# --------- MySQL config (Strato) ---------
-MYSQL_CONFIG = {
-    "host": "rdbms.strato.de",
-    "port": 3306,
-    "user": "dbu1211409",
-    "password": "8m4SCF6)F/zS",
-    "database": "dbs14310204",
-}
+# Remote PHP API
+API_URL = "https://kahibaro.com/api_insert_chapter.php"  # <-- adjust
+API_TOKEN = "Sonne121#"                         # <-- same as in PHP
+COURSE_ID = 20  # set this to your real course id in `courses`
 
-COURSE_ID = 100  # <-- Set this to your actual course id from `courses` table
-
-_mysql_conn: Optional[mysql.connector.connection.MySQLConnection] = None
-
-def get_mysql_conn():
-    """Lazy-connect to MySQL and reuse the connection."""
-    global _mysql_conn
-    if _mysql_conn is None or not _mysql_conn.is_connected():
-        _mysql_conn = mysql.connector.connect(**MYSQL_CONFIG)
-    return _mysql_conn
-
-
-# --------- SQLite setup ---------
+# ------------ SQLite helpers ------------
 def init_sqlite_db():
     conn = sqlite3.connect(SQLITE_DB_FILE)
     cur = conn.cursor()
 
-    # Chapters in SQLite (local tracking)
+    # Chapters table (local tracking, plus remote_id)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS chapters (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -65,11 +50,20 @@ def init_sqlite_db():
         level INTEGER NOT NULL,
         parent_id INTEGER,
         position INTEGER NOT NULL,
+        remote_id INTEGER,              -- MySQL id
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY(parent_id) REFERENCES chapters(id)
     )
     """)
 
+    # Try to add remote_id column if table already exists without it
+    try:
+        cur.execute("ALTER TABLE chapters ADD COLUMN remote_id INTEGER")
+    except sqlite3.OperationalError:
+        # Column already exists or other non-fatal error
+        pass
+
+    # Messages log
     cur.execute("""
     CREATE TABLE IF NOT EXISTS messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -88,19 +82,19 @@ def init_sqlite_db():
 
 def get_existing_sqlite_chapters() -> Dict[str, Dict[str, Any]]:
     """
-    Load all chapters from the local SQLite DB.
-    Map: original_title (German) -> info dict
+    Map: original_title (German) -> info dict (incl. remote_id).
     """
     conn = sqlite3.connect(SQLITE_DB_FILE)
     cur = conn.cursor()
     cur.execute(
-        "SELECT id, chat_id, original_title, title, level, parent_id, position FROM chapters"
+        "SELECT id, chat_id, original_title, title, level, parent_id, position, remote_id FROM chapters"
     )
     rows = cur.fetchall()
     conn.close()
 
     result: Dict[str, Dict[str, Any]] = {}
-    for chapter_id, chat_id, original_title, title, level, parent_id, position in rows:
+    for (chapter_id, chat_id, original_title, title,
+         level, parent_id, position, remote_id) in rows:
         result[original_title] = {
             "id": chapter_id,
             "chat_id": chat_id,
@@ -109,12 +103,12 @@ def get_existing_sqlite_chapters() -> Dict[str, Dict[str, Any]]:
             "level": level,
             "parent_id": parent_id,
             "position": position,
+            "remote_id": remote_id,
         }
     return result
 
 
 def get_next_sqlite_position_start() -> int:
-    """Get the next local position index (max(position)+1) for new chapters."""
     conn = sqlite3.connect(SQLITE_DB_FILE)
     cur = conn.cursor()
     cur.execute("SELECT COALESCE(MAX(position) + 1, 0) FROM chapters")
@@ -135,8 +129,9 @@ def create_sqlite_chapter(
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO chapters (chat_id, original_title, title, level, parent_id, position)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO chapters
+            (chat_id, original_title, title, level, parent_id, position, remote_id)
+        VALUES (?, ?, ?, ?, ?, ?, NULL)
         """,
         (chat_id, original_title, english_title, level, parent_id, position),
     )
@@ -144,6 +139,17 @@ def create_sqlite_chapter(
     conn.commit()
     conn.close()
     return chapter_id
+
+
+def update_sqlite_chapter_remote_id(chapter_id: int, remote_id: int):
+    conn = sqlite3.connect(SQLITE_DB_FILE)
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE chapters SET remote_id = ? WHERE id = ?",
+        (remote_id, chapter_id),
+    )
+    conn.commit()
+    conn.close()
 
 
 def save_sqlite_message(chat_id: int, chapter_id: Optional[int], role: str, content: str):
@@ -156,63 +162,51 @@ def save_sqlite_message(chat_id: int, chapter_id: Optional[int], role: str, cont
     conn.close()
 
 
-# --------- MySQL helpers ---------
-def load_mysql_chapters_by_name() -> Dict[str, int]:
-    """
-    Load existing chapters from MySQL for this course, keyed by `name` (German title).
-    """
-    conn = get_mysql_conn()
-    cur = conn.cursor(dictionary=True)
-    cur.execute("SELECT id, name FROM chapters WHERE course_id = %s", (COURSE_ID,))
-    rows = cur.fetchall()
-    cur.close()
-    return {row["name"]: row["id"] for row in rows}
-
-
-def create_mysql_chapter(
+# ------------ Remote PHP API helper ------------
+def create_remote_chapter(
     german_name: str,
-    parent_mysql_id: Optional[int],
+    parent_remote_id: Optional[int],
     position: int,
     english_title: str,
     content: str,
     description: Optional[str] = None,
-    is_active: bool = False,
+    is_active: bool = True,
 ) -> int:
-    """
-    Insert a chapter row into your Strato MySQL `chapters` table.
-    """
-    conn = get_mysql_conn()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO chapters
-            (name, course_id, parent_id, position, title, description, content, is_active)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-        """,
-        (
-            german_name,
-            COURSE_ID,
-            parent_mysql_id,
-            position,
-            english_title,
-            description,
-            content,
-            is_active,
-        ),
-    )
-    conn.commit()
-    chapter_id = cur.lastrowid
-    cur.close()
-    return chapter_id
+    payload = {
+        "name": german_name,
+        "course_id": COURSE_ID,
+        "parent_id": parent_remote_id,
+        "position": position,
+        "title": english_title,
+        "description": description,
+        "content": content,
+        "is_active": is_active,
+    }
+
+    headers = {
+        "X-API-TOKEN": API_TOKEN,
+        "Content-Type": "application/json",
+    }
+
+    resp = requests.post(API_URL, json=payload, headers=headers, timeout=30)
+
+    # Debug output
+    print("API status:", resp.status_code)
+    print("API response text:", resp.text)
+
+    # This will still raise for 4xx/5xx, but now you'll see the message
+    resp.raise_for_status()
+
+    data = resp.json()
+
+    if not data.get("success"):
+        raise RuntimeError(f"API error: {data}")
+
+    return int(data["chapter_id"])
 
 
-# --------- OpenAI interaction ---------
+# ------------ OpenAI interaction ------------
 def generate_chapter_from_german_title(german_title: str) -> Tuple[str, str]:
-    """
-    Sends the German chapter title and gets back:
-      - english_title
-      - chapter_text (English prose)
-    """
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {
@@ -228,7 +222,6 @@ def generate_chapter_from_german_title(german_title: str) -> Tuple[str, str]:
 
     raw_content = response.choices[0].message.content
 
-    # Parse the JSON returned by the model
     try:
         data = json.loads(raw_content)
     except json.JSONDecodeError as e:
@@ -245,10 +238,10 @@ def generate_chapter_from_german_title(german_title: str) -> Tuple[str, str]:
     return english_title, chapter_text
 
 
-# --------- Parse chapters.txt by '#' hierarchy ---------
+# ------------ Parse chapters.txt (# hierarchy) ------------
 def parse_chapters_file(filename: str):
     """
-    Lines should look like:
+    Lines like:
     # Kapitel 1
     ## Unterkapitel 1.1
     ### Unter-Unterkapitel 1.1.1
@@ -258,7 +251,6 @@ def parse_chapters_file(filename: str):
             line = raw_line.strip()
             if not line:
                 continue
-
             if not line.startswith("#"):
                 raise ValueError(f"Invalid line (must start with #): {line}")
 
@@ -266,56 +258,48 @@ def parse_chapters_file(filename: str):
             while level < len(line) and line[level] == "#":
                 level += 1
 
-            title = line[level:].strip()   # German title
+            title = line[level:].strip()  # German title
+            yield level - 1, title  # level 0 for one '#'
 
-            yield level - 1, title   # level 0 for one '#'
 
-
-# --------- Main ---------
+# ------------ Main ------------
 if __name__ == "__main__":
-    # Initialize SQLite
     init_sqlite_db()
 
-    # Load existing chapters from SQLite (for "already processed" detection)
     existing_sqlite_chapters = get_existing_sqlite_chapters()
-
-    # Next local position index
     position_counter = get_next_sqlite_position_start()
 
-    # Load existing chapters from MySQL to know their IDs by name (German)
-    mysql_chapters_by_name = load_mysql_chapters_by_name()
-
-    # Hierarchy stack: one entry per level
-    # Each entry: {"title": german_title, "sqlite_id": int, "mysql_id": Optional[int]}
+    # Hierarchy stack for *this* run
+    # Each entry: {"title": str, "sqlite_id": int, "remote_id": Optional[int]}
     level_stack: list[Dict[str, Any]] = []
 
     for level, german_title in parse_chapters_file("chapters.txt"):
-        # Adjust stack size according to the current level
+        # Adjust stack size
         while len(level_stack) > level + 1:
             level_stack.pop()
 
-        # Get parent info from stack (if any)
         parent_sqlite_id: Optional[int] = None
-        parent_mysql_id: Optional[int] = None
+        parent_remote_id: Optional[int] = None
         if level > 0 and len(level_stack) >= level:
             parent_entry = level_stack[level - 1]
             parent_sqlite_id = parent_entry.get("sqlite_id")
-            parent_mysql_id = parent_entry.get("mysql_id")
+            parent_remote_id = parent_entry.get("remote_id")
 
-        # If this chapter already exists in SQLite, skip generation
+        # Already processed locally?
         if german_title in existing_sqlite_chapters:
             existing = existing_sqlite_chapters[german_title]
             sqlite_id = existing["id"]
-            mysql_id = mysql_chapters_by_name.get(german_title)  # may be None if not yet in MySQL
+            remote_id = existing["remote_id"]
 
-            print(f"Skipping already processed chapter: '{german_title}' "
-                  f"(sqlite_id={sqlite_id}, mysql_id={mysql_id}, level={level})")
+            print(
+                f"Skipping already processed chapter: '{german_title}' "
+                f"(sqlite_id={sqlite_id}, remote_id={remote_id}, level={level})"
+            )
 
-            # Ensure it participates in the hierarchy for children
             entry = {
                 "title": german_title,
                 "sqlite_id": sqlite_id,
-                "mysql_id": mysql_id,
+                "remote_id": remote_id,
             }
             if len(level_stack) == level:
                 level_stack.append(entry)
@@ -324,14 +308,16 @@ if __name__ == "__main__":
 
             continue
 
-        # --- New chapter: process with model and store in both DBs ---
-        print(f"\n=== Processing NEW chapter L{level}: {german_title} (parent_sqlite={parent_sqlite_id}, parent_mysql={parent_mysql_id}) ===")
+        # --- New chapter ---
+        print(
+            f"\n=== Processing NEW chapter L{level}: {german_title} "
+            f"(parent_sqlite={parent_sqlite_id}, parent_remote={parent_remote_id}) ==="
+        )
 
-        # 1) Get English title + chapter text from the model
         english_title, chapter_text = generate_chapter_from_german_title(german_title)
         print(f"  → English title: {english_title}")
 
-        # 2) Insert into SQLite
+        # Insert into SQLite
         sqlite_chapter_id = create_sqlite_chapter(
             CHAT_ID,
             original_title=german_title,
@@ -341,18 +327,21 @@ if __name__ == "__main__":
             position=position_counter,
         )
 
-        # 3) Insert into MySQL
-        mysql_chapter_id = create_mysql_chapter(
+        # Insert into remote MySQL via PHP API
+        remote_chapter_id = create_remote_chapter(
             german_name=german_title,
-            parent_mysql_id=parent_mysql_id,
+            parent_remote_id=parent_remote_id,
             position=position_counter,
             english_title=english_title,
             content=chapter_text,
             description=None,
-            is_active=False,  # or True if you want it live immediately
+            is_active=False,
         )
 
-        # 4) Update in-memory maps so later children & runs know these chapters
+        # Store remote_id in SQLite
+        update_sqlite_chapter_remote_id(sqlite_chapter_id, remote_chapter_id)
+
+        # Update in-memory map and stack
         existing_sqlite_chapters[german_title] = {
             "id": sqlite_chapter_id,
             "chat_id": CHAT_ID,
@@ -361,27 +350,25 @@ if __name__ == "__main__":
             "level": level,
             "parent_id": parent_sqlite_id,
             "position": position_counter,
+            "remote_id": remote_chapter_id,
         }
-        mysql_chapters_by_name[german_title] = mysql_chapter_id
 
         position_counter += 1
 
-        # 5) Update hierarchy stack
         new_entry = {
             "title": german_title,
             "sqlite_id": sqlite_chapter_id,
-            "mysql_id": mysql_chapter_id,
+            "remote_id": remote_chapter_id,
         }
         if len(level_stack) == level:
             level_stack.append(new_entry)
         else:
             level_stack[level] = new_entry
 
-        # 6) Save local message log in SQLite
+        # Save message log
         save_sqlite_message(CHAT_ID, sqlite_chapter_id, "user", german_title)
         save_sqlite_message(CHAT_ID, sqlite_chapter_id, "assistant", chapter_text)
 
-        # 7) Print result
         print("\n--- Chapter text (assistant) ---\n")
         print(chapter_text)
         print("\n" + "=" * 80 + "\n")
