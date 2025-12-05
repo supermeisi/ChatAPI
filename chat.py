@@ -4,75 +4,87 @@ import sqlite3
 from openai import OpenAI
 
 # --------- Config ---------
-MODEL = "gpt-5.1"  # or another chat-capable model
+MODEL = "gpt-5.1"
 DB_FILE = "chat_history.db"
-
-# One chat/session id per run (similar to your timestamped JSON file)
-CHAT_ID = int(time.time())
+CHAT_ID = int(time.time())   # Identifies this run
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 SYSTEM_PROMPT = (
     "Ich schreibe an einem Kurs über Geschichte. "
-    "Du bist mein Assistent. "
     "Gib mir das folgende Kapitel als zusammenhängenden Prosatext "
-    "auf Englisch, ohne Gedankenstriche, ohne '---' zwischen Kapiteln, "
-    "und mit Zwischenüberschriften auf der obersten Ebene mit '#'."
+    "auf Englisch, ohne Gedankenstriche, keine '---', "
+    "und mit Zwischenüberschriften in der obersten Ebene mit '#'."
 )
 
-# --------- DB setup & helpers ---------
+# --------- DB setup ---------
 def init_db():
     conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS chapters (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id INTEGER NOT NULL,
+        title TEXT NOT NULL,
+        level INTEGER NOT NULL,
+        parent_id INTEGER,
+        position INTEGER NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(parent_id) REFERENCES chapters(id)
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id INTEGER NOT NULL,
+        chapter_id INTEGER,
+        role TEXT NOT NULL,
+        content TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(chapter_id) REFERENCES chapters(id)
+    )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+def create_chapter(chat_id, title, level, parent_id, position):
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO chapters (chat_id, title, level, parent_id, position)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (chat_id, title, level, parent_id, position),
+    )
+    chapter_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return chapter_id
+
+
+def save_message(chat_id, chapter_id, role, content):
+    conn = sqlite3.connect(DB_FILE)
     conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id INTEGER NOT NULL,
-            role TEXT NOT NULL,
-            content TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-        """
+        "INSERT INTO messages (chat_id, chapter_id, role, content) VALUES (?, ?, ?, ?)",
+        (chat_id, chapter_id, role, content),
     )
     conn.commit()
     conn.close()
 
-def save_message(chat_id: int, role: str, content: str):
-    conn = sqlite3.connect(DB_FILE)
-    conn.execute(
-        "INSERT INTO messages (chat_id, role, content) VALUES (?, ?, ?)",
-        (chat_id, role, content),
-    )
-    conn.commit()
-    conn.close()
-
-def load_history(chat_id: int):
-    """If you ever want to send past context, you can use this."""
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.execute(
-        "SELECT role, content FROM messages WHERE chat_id=? ORDER BY id",
-        (chat_id,),
-    )
-    rows = cur.fetchall()
-    conn.close()
-    return [{"role": role, "content": content} for role, content in rows]
 
 # --------- OpenAI interaction ---------
-def send_to_existing_chat(user_message: str) -> str:
-    # Log the user message
-    save_message(CHAT_ID, "user", user_message)
+def send_to_existing_chat(chapter_id, user_message: str) -> str:
+    save_message(CHAT_ID, chapter_id, "user", user_message)
 
-    # If you *want* previous messages as context, uncomment:
-    history = load_history(CHAT_ID)
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history + [
-         {"role": "user", "content": user_message}
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_message},
     ]
-
-    # If you want each chapter independent (no context bleed), do this:
-    # messages = [
-    #    {"role": "system", "content": SYSTEM_PROMPT},
-    #    {"role": "user", "content": user_message},
-    #]
 
     response = client.chat.completions.create(
         model=MODEL,
@@ -81,26 +93,77 @@ def send_to_existing_chat(user_message: str) -> str:
 
     assistant_message = response.choices[0].message.content
 
-    # Log assistant reply
-    save_message(CHAT_ID, "assistant", assistant_message)
+    save_message(CHAT_ID, chapter_id, "assistant", assistant_message)
 
     return assistant_message
+
+
+# --------- Parse chapters.txt by '#' hierarchy ---------
+def parse_chapters_file(filename: str):
+    """
+    Lines must look like:
+    # Title
+    ## Subtitle
+    ### Sub-subtitle
+    """
+    with open(filename, encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            # Count # at start
+            if not line.startswith("#"):
+                raise ValueError(f"Invalid line (must start with #): {line}")
+
+            level = 0
+            while level < len(line) and line[level] == "#":
+                level += 1
+
+            title = line[level:].strip()
+
+            yield level - 1, title   # level 0 = one '#'
+
 
 # --------- Main ---------
 if __name__ == "__main__":
     init_db()
 
-    with open("chapters.txt", encoding="utf-8") as file:
-        for line in file:
-            chapter_text = line.rstrip()
-            if not chapter_text:
-                continue  # skip empty lines
+    level_stack = []  # at index L → chapter_id at level L
+    position_counter = 0
 
-            print("Input chapter line:")
-            print(chapter_text)
+    for level, title in parse_chapters_file("chapters.txt"):
 
-            reply = send_to_existing_chat(chapter_text)
+        # Shrink stack when moving up in hierarchy
+        while len(level_stack) > level + 1:
+            level_stack.pop()
 
-            print("\nAssistant:\n", reply)
-            print("\n" + "=" * 80 + "\n")
+        # Determine parent ID
+        parent_id = None
+        if level > 0:
+            parent_id = level_stack[level - 1]
+
+        # Create new chapter record
+        chapter_id = create_chapter(
+            CHAT_ID,
+            title,
+            level,
+            parent_id,
+            position_counter
+        )
+        position_counter += 1
+
+        # Update stack
+        if len(level_stack) == level:
+            level_stack.append(chapter_id)
+        else:
+            level_stack[level] = chapter_id
+
+        print(f"Processing L{level}: {title} (id={chapter_id}, parent={parent_id})")
+
+        # Send chapter title to ChatGPT
+        reply = send_to_existing_chat(chapter_id, title)
+
+        print("\nAssistant:\n", reply)
+        print("\n" + "=" * 80 + "\n")
 
