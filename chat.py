@@ -9,31 +9,28 @@ from openai import OpenAI
 
 # ------------ Config ------------
 MODEL = "gpt-5.1"
-SQLITE_DB_FILE = "chat_history.db"
+SQLITE_DB_FILE = "chat_history_linux.db"
 CHAT_ID = int(time.time())
 
 # OpenAI
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
+# System prompt: just produce chapter text from a given title
 SYSTEM_PROMPT = (
-    "You are helping to write a history course.\n"
-    "For each request you receive a chapter title in German.\n"
-    "You MUST answer ONLY with valid JSON of the form:\n"
-    "{\n"
-    '  \"english_title\": \"<short English chapter title>\",\n'
-    '  \"chapter_text\": \"<full chapter text in English>\"\n'
-    "}\n"
-    "- english_title: a concise English chapter heading.\n"
-    "- chapter_text: a continuous prose chapter in English, "
-    "with top-level headings using '#', no bullet lists, "
-    "no '---' separators.\n"
-    "Do not write any text outside the JSON."
+    "You are helping to write a Linux course with sections and subsections.\n"
+    "For each request you receive a section or subsection title.\n"
+    # "- Write a continuous prose chapter in English.\n"
+    "- Use top-level headings with '#' not including the section title.\n"
+    "- Do not use '---' separators.\n"
+    "- Write equations and formulas as Latex equations encapsulated in $$ for inline math and $$$$ for math mode.\n"
+    "- Write inline code encapsulated with ` and code blocks within :::code :::.\n"
+    "Answer only with the chapter text, no explanations around it."
 )
 
-# Remote PHP API
-API_URL = "https://kahibaro.com/api_insert_chapter.php"  # <-- adjust
-API_TOKEN = "Sonne121#"                         # <-- same as in PHP
-COURSE_ID = 20  # set this to your real course id in `courses`
+# Remote PHP API (your endpoint)
+API_URL = "https://kahibaro.com/api_insert_chapter.php"  # <-- adjust if needed
+API_TOKEN = "Sonne121#"                      # <-- same as in PHP
+COURSE_ID = 25  # set this to your real course id in `courses`
 
 # ------------ SQLite helpers ------------
 def init_sqlite_db():
@@ -45,12 +42,12 @@ def init_sqlite_db():
     CREATE TABLE IF NOT EXISTS chapters (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         chat_id INTEGER NOT NULL,
-        original_title TEXT NOT NULL,   -- German
-        title TEXT NOT NULL,            -- English
+        original_title TEXT NOT NULL,   -- here: same as title
+        title TEXT NOT NULL,            -- chapter title (already in correct language)
         level INTEGER NOT NULL,
         parent_id INTEGER,
         position INTEGER NOT NULL,
-        remote_id INTEGER,              -- MySQL id
+        remote_id INTEGER,              -- MySQL id (from PHP API)
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY(parent_id) REFERENCES chapters(id)
     )
@@ -82,7 +79,8 @@ def init_sqlite_db():
 
 def get_existing_sqlite_chapters() -> Dict[str, Dict[str, Any]]:
     """
-    Map: original_title (German) -> info dict (incl. remote_id).
+    Map: original_title -> info dict (incl. remote_id).
+    We use original_title as the key to detect already processed chapters.
     """
     conn = sqlite3.connect(SQLITE_DB_FILE)
     cur = conn.cursor()
@@ -119,12 +117,15 @@ def get_next_sqlite_position_start() -> int:
 
 def create_sqlite_chapter(
     chat_id: int,
-    original_title: str,
-    english_title: str,
+    chapter_title: str,
     level: int,
     parent_id: Optional[int],
     position: int,
 ) -> int:
+    """
+    Store a chapter locally in SQLite.
+    original_title and title are the same now.
+    """
     conn = sqlite3.connect(SQLITE_DB_FILE)
     cur = conn.cursor()
     cur.execute(
@@ -133,7 +134,7 @@ def create_sqlite_chapter(
             (chat_id, original_title, title, level, parent_id, position, remote_id)
         VALUES (?, ?, ?, ?, ?, ?, NULL)
         """,
-        (chat_id, original_title, english_title, level, parent_id, position),
+        (chat_id, chapter_title, chapter_title, level, parent_id, position),
     )
     chapter_id = cur.lastrowid
     conn.commit()
@@ -164,20 +165,23 @@ def save_sqlite_message(chat_id: int, chapter_id: Optional[int], role: str, cont
 
 # ------------ Remote PHP API helper ------------
 def create_remote_chapter(
-    german_name: str,
+    title: str,
     parent_remote_id: Optional[int],
     position: int,
-    english_title: str,
     content: str,
     description: Optional[str] = None,
     is_active: bool = True,
 ) -> int:
+    """
+    Call your PHP API to create a chapter in the MySQL database.
+    We use the same string for `name` and `title` in the MySQL schema.
+    """
     payload = {
-        "name": german_name,
+        "name": title,            # previously German; now just the chapter title
         "course_id": COURSE_ID,
         "parent_id": parent_remote_id,
         "position": position,
-        "title": english_title,
+        "title": title,           # English (or whatever language you now use)
         "description": description,
         "content": content,
         "is_active": is_active,
@@ -190,13 +194,11 @@ def create_remote_chapter(
 
     resp = requests.post(API_URL, json=payload, headers=headers, timeout=30)
 
-    # Debug output
+    # Debug: show any server errors
     print("API status:", resp.status_code)
     print("API response text:", resp.text)
 
-    # This will still raise for 4xx/5xx, but now you'll see the message
     resp.raise_for_status()
-
     data = resp.json()
 
     if not data.get("success"):
@@ -206,12 +208,15 @@ def create_remote_chapter(
 
 
 # ------------ OpenAI interaction ------------
-def generate_chapter_from_german_title(german_title: str) -> Tuple[str, str]:
+def generate_chapter_text(chapter_title: str) -> str:
+    """
+    Send the chapter title to the model and get back plain chapter text (no JSON).
+    """
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {
             "role": "user",
-            "content": f"Kapitelüberschrift (Deutsch): \"{german_title}\"",
+            "content": f"Chapter title: \"{chapter_title}\"",
         },
     ]
 
@@ -220,31 +225,22 @@ def generate_chapter_from_german_title(german_title: str) -> Tuple[str, str]:
         messages=messages,
     )
 
-    raw_content = response.choices[0].message.content
-
-    try:
-        data = json.loads(raw_content)
-    except json.JSONDecodeError as e:
-        raise RuntimeError(f"Model did not return valid JSON: {raw_content}") from e
-
-    english_title = data.get("english_title", "").strip()
-    chapter_text = data.get("chapter_text", "").strip()
-
-    if not english_title:
-        raise RuntimeError(f"No 'english_title' in model response: {raw_content}")
-    if not chapter_text:
-        raise RuntimeError(f"No 'chapter_text' in model response: {raw_content}")
-
-    return english_title, chapter_text
+    chapter_text = response.choices[0].message.content
+    return chapter_text.strip()
 
 
 # ------------ Parse chapters.txt (# hierarchy) ------------
 def parse_chapters_file(filename: str):
     """
     Lines like:
-    # Kapitel 1
-    ## Unterkapitel 1.1
-    ### Unter-Unterkapitel 1.1.1
+    # Chapter 1
+    ## Subchapter 1.1
+    ### Sub-subchapter 1.1.1
+
+    Level mapping:
+    - '# '   -> level 0
+    - '## '  -> level 1
+    - '### ' -> level 2
     """
     with open(filename, encoding="utf-8") as f:
         for raw_line in f:
@@ -258,7 +254,7 @@ def parse_chapters_file(filename: str):
             while level < len(line) and line[level] == "#":
                 level += 1
 
-            title = line[level:].strip()  # German title
+            title = line[level:].strip()  # chapter title
             yield level - 1, title  # level 0 for one '#'
 
 
@@ -273,8 +269,8 @@ if __name__ == "__main__":
     # Each entry: {"title": str, "sqlite_id": int, "remote_id": Optional[int]}
     level_stack: list[Dict[str, Any]] = []
 
-    for level, german_title in parse_chapters_file("chapters.txt"):
-        # Adjust stack size
+    for level, chapter_title in parse_chapters_file("chapters_linux.txt"):
+        # Adjust stack size based on current level
         while len(level_stack) > level + 1:
             level_stack.pop()
 
@@ -285,19 +281,19 @@ if __name__ == "__main__":
             parent_sqlite_id = parent_entry.get("sqlite_id")
             parent_remote_id = parent_entry.get("remote_id")
 
-        # Already processed locally?
-        if german_title in existing_sqlite_chapters:
-            existing = existing_sqlite_chapters[german_title]
+        # Check if this title was already processed
+        if chapter_title in existing_sqlite_chapters:
+            existing = existing_sqlite_chapters[chapter_title]
             sqlite_id = existing["id"]
             remote_id = existing["remote_id"]
 
             print(
-                f"Skipping already processed chapter: '{german_title}' "
+                f"Skipping already processed chapter: '{chapter_title}' "
                 f"(sqlite_id={sqlite_id}, remote_id={remote_id}, level={level})"
             )
 
             entry = {
-                "title": german_title,
+                "title": chapter_title,
                 "sqlite_id": sqlite_id,
                 "remote_id": remote_id,
             }
@@ -310,43 +306,41 @@ if __name__ == "__main__":
 
         # --- New chapter ---
         print(
-            f"\n=== Processing NEW chapter L{level}: {german_title} "
+            f"\n=== Processing NEW chapter L{level}: {chapter_title} "
             f"(parent_sqlite={parent_sqlite_id}, parent_remote={parent_remote_id}) ==="
         )
 
-        english_title, chapter_text = generate_chapter_from_german_title(german_title)
-        print(f"  → English title: {english_title}")
+        # 1) Generate chapter text from the title
+        chapter_text = generate_chapter_text(chapter_title)
 
-        # Insert into SQLite
+        # 2) Insert into SQLite
         sqlite_chapter_id = create_sqlite_chapter(
             CHAT_ID,
-            original_title=german_title,
-            english_title=english_title,
+            chapter_title=chapter_title,
             level=level,
             parent_id=parent_sqlite_id,
             position=position_counter,
         )
 
-        # Insert into remote MySQL via PHP API
+        # 3) Insert into remote MySQL via PHP API
         remote_chapter_id = create_remote_chapter(
-            german_name=german_title,
+            title=chapter_title,
             parent_remote_id=parent_remote_id,
             position=position_counter,
-            english_title=english_title,
             content=chapter_text,
             description=None,
-            is_active=False,
+            is_active=True,
         )
 
-        # Store remote_id in SQLite
+        # 4) Store remote_id in SQLite
         update_sqlite_chapter_remote_id(sqlite_chapter_id, remote_chapter_id)
 
-        # Update in-memory map and stack
-        existing_sqlite_chapters[german_title] = {
+        # 5) Update in-memory map and stack
+        existing_sqlite_chapters[chapter_title] = {
             "id": sqlite_chapter_id,
             "chat_id": CHAT_ID,
-            "original_title": german_title,
-            "title": english_title,
+            "original_title": chapter_title,
+            "title": chapter_title,
             "level": level,
             "parent_id": parent_sqlite_id,
             "position": position_counter,
@@ -356,7 +350,7 @@ if __name__ == "__main__":
         position_counter += 1
 
         new_entry = {
-            "title": german_title,
+            "title": chapter_title,
             "sqlite_id": sqlite_chapter_id,
             "remote_id": remote_chapter_id,
         }
@@ -365,10 +359,11 @@ if __name__ == "__main__":
         else:
             level_stack[level] = new_entry
 
-        # Save message log
-        save_sqlite_message(CHAT_ID, sqlite_chapter_id, "user", german_title)
+        # 6) Save message log
+        save_sqlite_message(CHAT_ID, sqlite_chapter_id, "user", chapter_title)
         save_sqlite_message(CHAT_ID, sqlite_chapter_id, "assistant", chapter_text)
 
+        # 7) Show output
         print("\n--- Chapter text (assistant) ---\n")
         print(chapter_text)
         print("\n" + "=" * 80 + "\n")
