@@ -2,35 +2,46 @@ import os
 import time
 import json
 import sqlite3
-from typing import Dict, Any, Tuple, Optional
+from typing import Dict, Any, Tuple, Optional, List
 
 import requests
 from openai import OpenAI
 
 # ------------ Config ------------
 MODEL = "gpt-5.1"
-SQLITE_DB_FILE = "chat_history_linux.db"
+SQLITE_DB_FILE = "chat_history_chemistry.db"
 CHAT_ID = int(time.time())
+CHAPTERS_FILE = "chapters_chemistry.txt"
 
 # OpenAI
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# System prompt: just produce chapter text from a given title
+# ------------ System prompt ------------
 SYSTEM_PROMPT = (
-    "You are helping to write a Linux course with sections and subsections.\n"
-    "For each request you receive a section or subsection title.\n"
-    # "- Write a continuous prose chapter in English.\n"
-    "- Use top-level headings with '#' not including the section title.\n"
+    "You are helping to write a chemistry course for absolute beginners.\n"
+    "You always receive:\n"
+    "  - The FULL course outline.\n"
+    "  - The exact position of the current chapter as a hierarchy.\n"
+    "Your job:\n"
+    "- Write ONLY the content for the CURRENT chapter.\n"
+    "- Assume that every other title in the outline will have its OWN chapter.\n"
+    "- Do NOT fully explain concepts that clearly belong to other titles.\n"
+    "- If something is covered by a parent chapter, do not re-explain it in the child chapter.\n"
+    "- Focus on what is UNIQUE and SPECIFIC to the current chapter.\n"
+    "\n"
+    "Formatting rules:\n"
+    "- Use top-level headings with '#' but do NOT repeat the chapter title itself as a heading.\n"
     "- Do not use '---' separators.\n"
-    "- Write equations and formulas as Latex equations encapsulated in $$ for inline math and $$$$ for math mode.\n"
+    "- Write equations and formulas as LaTeX equations encapsulated in $ for inline math "
+    "  and $$ for display math.\n"
     "- Write inline code encapsulated with ` and code blocks within :::code :::.\n"
-    "Answer only with the chapter text, no explanations around it."
+    "- Answer only with the chapter text, no explanations around it."
 )
 
 # Remote PHP API (your endpoint)
-API_URL = "https://kahibaro.com/api_insert_chapter.php"  # <-- adjust if needed
-API_TOKEN = "Sonne121#"                      # <-- same as in PHP
-COURSE_ID = 25  # set this to your real course id in `courses`
+API_URL = "https://kahibaro.com/api_insert_chapter.php"
+API_TOKEN = "Sonne121#"  # <-- same as in PHP
+COURSE_ID = 20  # set this to your real course id in `courses`
 
 # ------------ SQLite helpers ------------
 def init_sqlite_db():
@@ -177,11 +188,11 @@ def create_remote_chapter(
     We use the same string for `name` and `title` in the MySQL schema.
     """
     payload = {
-        "name": title,            # previously German; now just the chapter title
+        "name": title,
         "course_id": COURSE_ID,
         "parent_id": parent_remote_id,
         "position": position,
-        "title": title,           # English (or whatever language you now use)
+        "title": title,
         "description": description,
         "content": content,
         "is_active": is_active,
@@ -208,16 +219,34 @@ def create_remote_chapter(
 
 
 # ------------ OpenAI interaction ------------
-def generate_chapter_text(chapter_title: str) -> str:
+def generate_chapter_text(path_titles: List[str], outline_str: str) -> str:
     """
-    Send the chapter title to the model and get back plain chapter text (no JSON).
+    Send the full course outline and the hierarchical path of the current chapter
+    to the model and get back plain chapter text (no JSON).
     """
+    current_title = path_titles[-1]
+    hierarchy_str = " > ".join(path_titles)
+
+    user_prompt = (
+        "Here is the FULL outline of the Linux course:\n\n"
+        f"{outline_str}\n\n"
+        "You are now writing the chapter for this specific position in the outline:\n"
+        f"{hierarchy_str}\n\n"
+        "Current chapter title:\n"
+        f"\"{current_title}\"\n\n"
+        "Important rules:\n"
+        "- Assume every other title in the outline has its own chapter.\n"
+        "- Do NOT repeat detailed explanations that clearly belong to other chapters.\n"
+        "  * For example, if 'What is an operating system' is another chapter, "
+        "    do not fully re-explain what an operating system is here.\n"
+        "- If the current chapter is a subsection, assume the parent chapter already "
+        "  introduced the general concept; here you go deeper or focus on the specific angle.\n"
+        "- Focus only on content that is specific and appropriate to this chapter.\n"
+    )
+
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": f"Chapter title: \"{chapter_title}\"",
-        },
+        {"role": "user", "content": user_prompt},
     ]
 
     response = client.chat.completions.create(
@@ -262,14 +291,20 @@ def parse_chapters_file(filename: str):
 if __name__ == "__main__":
     init_sqlite_db()
 
+    outline_list = list(parse_chapters_file(CHAPTERS_FILE))
+    outline_str = "\n".join(
+        f'{"#" * (level + 1)} {title}'
+        for level, title in outline_list
+    )
+
     existing_sqlite_chapters = get_existing_sqlite_chapters()
     position_counter = get_next_sqlite_position_start()
 
     # Hierarchy stack for *this* run
     # Each entry: {"title": str, "sqlite_id": int, "remote_id": Optional[int]}
-    level_stack: list[Dict[str, Any]] = []
+    level_stack: List[Dict[str, Any]] = []
 
-    for level, chapter_title in parse_chapters_file("chapters_linux.txt"):
+    for level, chapter_title in outline_list:
         # Adjust stack size based on current level
         while len(level_stack) > level + 1:
             level_stack.pop()
@@ -310,8 +345,10 @@ if __name__ == "__main__":
             f"(parent_sqlite={parent_sqlite_id}, parent_remote={parent_remote_id}) ==="
         )
 
-        # 1) Generate chapter text from the title
-        chapter_text = generate_chapter_text(chapter_title)
+        path_titles = [entry["title"] for entry in level_stack[:level]] + [chapter_title]
+
+        # 1) Generate chapter text from the hierarchical path + full outline
+        chapter_text = generate_chapter_text(path_titles, outline_str)
 
         # 2) Insert into SQLite
         sqlite_chapter_id = create_sqlite_chapter(
@@ -335,7 +372,7 @@ if __name__ == "__main__":
         # 4) Store remote_id in SQLite
         update_sqlite_chapter_remote_id(sqlite_chapter_id, remote_chapter_id)
 
-        # 5) Update in-memory map and stack
+        # 5) Store in in-memory map and stack
         existing_sqlite_chapters[chapter_title] = {
             "id": sqlite_chapter_id,
             "chat_id": CHAT_ID,
